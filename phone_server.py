@@ -5,13 +5,7 @@ import ssl
 import os
 import cv2
 import numpy as np
-try:
-    import pyrealsense2 as rs
-    REALSENSE_AVAILABLE = True
-except ImportError:
-    REALSENSE_AVAILABLE = False
-    print("Warning: pyrealsense2 not available. RealSense streaming will be disabled.")
-
+import threading
 from aiohttp import web
 
 class PhoneServer:
@@ -156,9 +150,9 @@ class PhoneServer:
     <div class="container">
         <h1>🤖 XLeRobotHead</h1>
         
-        <div class="video-container">
-            <div class="video-label">📹 RealSense Camera</div>
-            <img id="realsenseStream" src="/realsense_stream" alt="RealSense Stream" style="width: 100%; display: none;">
+            <div class="video-container">
+            <div class="video-label">📹 Video Stream</div>
+            <img id="realsenseStream" src="/realsense_stream" alt="Video Stream" style="width: 100%; display: none;">
         </div>
         
         <h2>📱 iPhone IMU Sender</h2>
@@ -286,7 +280,7 @@ class PhoneServer:
                 connectWebSocket();
                 window.addEventListener('deviceorientation', handleOrientation);
                 
-                // Start RealSense stream
+                // Start video stream
                 const realsenseStream = document.getElementById('realsenseStream');
                 if (realsenseStream) {
                     realsenseStream.src = '/realsense_stream?' + new Date().getTime();
@@ -304,7 +298,7 @@ class PhoneServer:
                     ws.close();
                 }
                 
-                // Stop RealSense stream
+                // Stop video stream
                 const realsenseStream = document.getElementById('realsenseStream');
                 if (realsenseStream) {
                     realsenseStream.src = '';
@@ -328,21 +322,13 @@ class PhoneServer:
         self.pitch = 0.0
         self.yaw = 0.0
         
-        # RealSense camera setup
-        self.realsense_pipeline = None
-        self.realsense_config = None
-        self.realsense_lock = asyncio.Lock()
+        # Frame storage for external frames
+        self.current_frame = None
         
-        if REALSENSE_AVAILABLE:
-            try:
-                self.realsense_pipeline = rs.pipeline()
-                self.realsense_config = rs.config()
-                self.realsense_config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-                self.realsense_pipeline.start(self.realsense_config)
-                print("✓ RealSense camera initialized")
-            except Exception as e:
-                print(f"⚠ RealSense camera error: {e}")
-                self.realsense_pipeline = None
+        # Server state
+        self.server_thread = None
+        self.server_running = False
+        self.runner = None
     
     @staticmethod
     def get_local_ip():
@@ -395,33 +381,33 @@ class PhoneServer:
             print("✓ pyOpenSSL installed. Please run the script again.")
             return False
     
-    async def get_realsense_frame(self):
-        """Get the latest frame from RealSense camera"""
-        if not self.realsense_pipeline:
-            return None
+    def update_frame(self, frame: np.ndarray):
+        """
+        Update the current frame from external source.
         
-        try:
-            frames = self.realsense_pipeline.wait_for_frames()
-            color_frame = frames.get_color_frame()
-            if not color_frame:
-                return None
-            
-            frame = np.asanyarray(color_frame.get_data())
-            # Convert BGR to RGB
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            return frame
-        except Exception as e:
-            print(f"RealSense frame error: {e}")
-            return None
+        Args:
+            frame: numpy array of uint8, shape (H, W, 3) in BGR format
+        """
+        if frame is not None and isinstance(frame, np.ndarray):
+            # Make a copy to avoid issues with external modifications
+            self.current_frame = frame.copy()
     
-    def stop_realsense(self):
-        """Stop RealSense camera"""
-        if self.realsense_pipeline:
-            try:
-                self.realsense_pipeline.stop()
-                print("✓ RealSense camera stopped")
-            except:
-                pass
+    def get_current_frame(self):
+        """Get the latest frame"""
+        return self.current_frame.copy() if self.current_frame is not None else None
+    
+    def get_angles(self):
+        """
+        Get current orientation angles.
+        
+        Returns:
+            dict: Dictionary with 'roll', 'pitch', 'yaw' in degrees
+        """
+        return {
+            'roll': self.roll,
+            'pitch': self.pitch,
+            'yaw': self.yaw
+        }
     
     async def websocket_handler(self, request):
         """Handle WebSocket connections for IMU data"""
@@ -457,23 +443,39 @@ class PhoneServer:
         return web.Response(text=self.HTML_PAGE, content_type='text/html')
     
     async def realsense_stream_handler(self, request):
-        """MJPEG stream handler for RealSense video"""
+        """MJPEG stream handler for video frames"""
         response = web.StreamResponse()
         response.headers['Content-Type'] = 'multipart/x-mixed-replace; boundary=frame'
         await response.prepare(request)
         
-        print(f"RealSense stream started for {request.remote}")
+        print(f"Video stream started for {request.remote}")
+        
+        # Create placeholder for when no frame is available
+        placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(placeholder, 'Waiting for frames...', (50, 240), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        _, placeholder_buffer = cv2.imencode('.jpg', placeholder)
         
         while True:
-            frame = await self.get_realsense_frame()
+            frame = self.get_current_frame()
             if frame is not None:
+                # Frame is expected to be in BGR format (uint8)
+                # Ensure it's the right format
+                if frame.dtype != np.uint8:
+                    frame = frame.astype(np.uint8)
+                
                 # Encode frame as JPEG
-                _, buffer = cv2.imencode('.jpg', cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), 
-                                        [cv2.IMWRITE_JPEG_QUALITY, 85])
+                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 
                 await response.write(b'--frame\r\n')
                 await response.write(b'Content-Type: image/jpeg\r\n\r\n')
                 await response.write(buffer.tobytes())
+                await response.write(b'\r\n')
+            else:
+                # Send placeholder if no frame available
+                await response.write(b'--frame\r\n')
+                await response.write(b'Content-Type: image/jpeg\r\n\r\n')
+                await response.write(placeholder_buffer.tobytes())
                 await response.write(b'\r\n')
             
             await asyncio.sleep(1/30)  # ~30 FPS
@@ -486,43 +488,101 @@ class PhoneServer:
         app.router.add_get('/realsense_stream', self.realsense_stream_handler)
         return app
     
-    def start_server(self, host='0.0.0.0', port=8443):
-        """Start the HTTPS server"""
-        if not os.path.exists('cert.pem') or not os.path.exists('key.pem'):
-            print("Creating SSL certificate...")
-            if not self.create_self_signed_cert():
-                return
+    def _run_server(self, host='0.0.0.0', port=8443):
+        """Internal method to run server in event loop"""
+        async def start():
+            if not os.path.exists('cert.pem') or not os.path.exists('key.pem'):
+                print("Creating SSL certificate...")
+                if not self.create_self_signed_cert():
+                    return
+            
+            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_context.load_cert_chain('cert.pem', 'key.pem')
+            
+            local_ip = self.get_local_ip()
+            print("\n" + "=" * 70)
+            print("XLeRobotHead - IMU & RealSense Server")
+            print("=" * 70)
+            print(f"✓ Server started with HTTPS support!")
+            print(f"\n📱 iPhone: Open Safari and go to:")
+            print(f"   https://{local_ip}:{port}\n")
+            print(f"Features available:")
+            print(f"  • Video Frame Streaming (external frames)")
+            print(f"  • iOS IMU/Orientation Data (Fused)")
+            print("=" * 70)
+            print("Waiting for connection...\n")
+            
+            app = self.create_app()
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, host, port, ssl_context=ssl_context)
+            await site.start()
+            
+            # Store runner for cleanup
+            self.runner = runner
+            
+            # Keep running
+            while self.server_running:
+                await asyncio.sleep(1)
+            
+            # Cleanup when stopping
+            await runner.cleanup()
         
-        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        ssl_context.load_cert_chain('cert.pem', 'key.pem')
-        
-        local_ip = self.get_local_ip()
-        print("\n" + "=" * 70)
-        print("XLeRobotHead - IMU & RealSense Server")
-        print("=" * 70)
-        print(f"✓ Server started with HTTPS support!")
-        print(f"\n📱 iPhone: Open Safari and go to:")
-        print(f"   https://{local_ip}:{port}\n")
-        print(f"Features available:")
-        print(f"  • RealSense Camera Streaming")
-        print(f"  • iOS IMU/Orientation Data (Fused)")
-        if not REALSENSE_AVAILABLE:
-            print(f"  ⚠ RealSense not available (install pyrealsense2)")
-        print("=" * 70)
-        print("Waiting for connection...\n")
-        
-        app = self.create_app()
-        web.run_app(app, host=host, port=port, ssl_context=ssl_context, print=None)
-    
-    def run(self):
-        """Run the server (main entry point)"""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            self.start_server()
-        except KeyboardInterrupt:
-            print("\n\nServer stopped by user")
+            loop.run_until_complete(start())
+        except Exception as e:
+            print(f"Server error: {e}")
         finally:
-            # Cleanup
-            self.stop_realsense()
+            loop.close()
+    
+    def run(self, host='0.0.0.0', port=8443, background=True):
+        """
+        Run the server.
+        
+        Args:
+            host: Server host (default: '0.0.0.0')
+            port: Server port (default: 8443)
+            background: If True, run in background thread (default: True)
+        """
+        if self.server_running:
+            print("Server is already running!")
+            return
+        
+        self.server_running = True
+        
+        if background:
+            # Run in background thread
+            self.server_thread = threading.Thread(
+                target=self._run_server,
+                args=(host, port),
+                daemon=True
+            )
+            self.server_thread.start()
+            print("Server started in background thread")
+        else:
+            # Run in current thread (blocking)
+            try:
+                self._run_server(host, port)
+            except KeyboardInterrupt:
+                print("\n\nServer stopped by user")
+            finally:
+                self.server_running = False
+    
+    def stop(self):
+        """Stop the server"""
+        if not self.server_running:
+            print("Server is not running!")
+            return
+        
+        self.server_running = False
+        
+        # Wait for thread to finish
+        if self.server_thread and self.server_thread.is_alive():
+            self.server_thread.join(timeout=3)
+        
+        print("Server stopped")
 
 
 def main():
