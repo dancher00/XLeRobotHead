@@ -155,7 +155,7 @@ class PhoneServer:
             <img id="realsenseStream" src="/realsense_stream" alt="Video Stream" style="width: 100%; display: none;">
         </div>
         
-        <h2>📱 iPhone IMU Sender</h2>
+        <h2>📱 Phone IMU Sender</h2>
         
         <div id="imuStatus" class="status disconnected">
             Disconnected
@@ -182,12 +182,26 @@ class PhoneServer:
         </button>
         
         <div class="info">
-            <span>iOS sensor fusion</span>
+            <span id="platformInfo">Device sensor fusion</span>
         </div>
         <div class="rate" id="updateRate"></div>
     </div>
 
     <script>
+        // Detect platform
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+                     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+        const isAndroid = /Android/.test(navigator.userAgent);
+        
+        // Update platform info
+        if (isIOS) {
+            document.getElementById('platformInfo').textContent = 'iOS sensor fusion';
+        } else if (isAndroid) {
+            document.getElementById('platformInfo').textContent = 'Android sensor fusion';
+        } else {
+            document.getElementById('platformInfo').textContent = 'Device sensor fusion';
+        }
+        
         // IMU WebSocket
         let ws = null;
         let isStreaming = false;
@@ -262,18 +276,42 @@ class PhoneServer:
             const btn = document.getElementById('toggleBtn');
             
             if (!isStreaming) {
-                // Request permissions
-                if (typeof DeviceOrientationEvent !== 'undefined' && 
-                    typeof DeviceOrientationEvent.requestPermission === 'function') {
+                // Check if DeviceOrientationEvent is supported
+                if (typeof DeviceOrientationEvent === 'undefined') {
+                    alert('Device orientation is not supported on this device/browser');
+                    return;
+                }
+                
+                // Request permissions (iOS 13+ requires explicit permission)
+                if (isIOS && typeof DeviceOrientationEvent.requestPermission === 'function') {
                     try {
                         const permission = await DeviceOrientationEvent.requestPermission();
                         if (permission !== 'granted') {
-                            alert('Permission denied for device orientation');
+                            alert('Permission denied for device orientation. Please allow access in Settings.');
                             return;
                         }
                     } catch (error) {
                         alert('Error requesting permission: ' + error);
                         return;
+                    }
+                }
+                
+                // Android and other platforms: check if orientation is available
+                // On some Android devices, orientation might not be available immediately
+                if (!isIOS) {
+                    // Try to detect if orientation is available
+                    let orientationAvailable = false;
+                    const testHandler = () => {
+                        orientationAvailable = true;
+                        window.removeEventListener('deviceorientation', testHandler);
+                    };
+                    window.addEventListener('deviceorientation', testHandler);
+                    
+                    // Wait a bit to see if we get orientation data
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                    
+                    if (!orientationAvailable && isAndroid) {
+                        console.warn('Device orientation may not be available. Make sure you are using HTTPS.');
                     }
                 }
                 
@@ -321,6 +359,25 @@ class PhoneServer:
         self.roll = 0.0
         self.pitch = 0.0
         self.yaw = 0.0
+        
+        # Calibration offsets (initial angles at connection time)
+        self.offset_roll = 0.0
+        self.offset_pitch = 0.0
+        self.offset_yaw = 0.0
+        self.calibrated = False
+        
+        # Previous angles for smooth wrapping (store raw relative angles before normalization)
+        self.prev_raw_roll = 0.0
+        self.prev_raw_pitch = 0.0
+        self.prev_raw_yaw = 0.0
+        self.prev_norm_roll = 0.0
+        self.prev_norm_pitch = 0.0
+        self.prev_norm_yaw = 0.0
+        
+        # Track consecutive boundary hits to detect stuck angles
+        self.boundary_count_roll = 0
+        self.boundary_count_pitch = 0
+        self.boundary_count_yaw = 0
         
         # Frame storage for external frames
         self.current_frame = None
@@ -396,46 +453,189 @@ class PhoneServer:
         """Get the latest frame"""
         return self.current_frame.copy() if self.current_frame is not None else None
     
-    def get_angles(self):
+    @staticmethod
+    def normalize_angle(angle, prev_raw_angle, prev_norm_angle, boundary_count=0, min_val=-90, max_val=90):
         """
-        Get current orientation angles.
+        Normalize angle to range [min_val, max_val] with smooth unwrapping.
+        Uses previous raw and normalized angles to detect boundary crossings and unwrap smoothly.
+        
+        Args:
+            angle: Current raw angle value
+            prev_raw_angle: Previous raw angle value (for detecting direction)
+            prev_norm_angle: Previous normalized angle value (for boundary detection)
+            boundary_count: Number of consecutive times angle was at boundary
+            min_val: Minimum angle value (default: -90)
+            max_val: Maximum angle value (default: +90)
         
         Returns:
-            dict: Dictionary with 'roll', 'pitch', 'yaw' in degrees
+            Tuple of (normalized angle, updated boundary_count)
         """
+        # Normalize to -180..+180 range first (handle any angle value)
+        angle = ((angle + 180) % 360) - 180
+        prev_raw_normalized = ((prev_raw_angle + 180) % 360) - 180
+        
+        # Unwrap: if there's a large jump, it might be due to wrapping
+        # Adjust angle to be closer to previous value
+        diff = angle - prev_raw_normalized
+        if diff > 180:
+            angle -= 360
+        elif diff < -180:
+            angle += 360
+        
+        # Detect if we're stuck at boundary and need to unwrap
+        # Check if previous normalized was at boundary (with tolerance)
+        at_max_boundary = abs(prev_norm_angle - max_val) < 1.0
+        at_min_boundary = abs(prev_norm_angle - min_val) < 1.0
+        
+        # Calculate direction of movement from raw angles
+        raw_diff = angle - prev_raw_normalized
+        
+        # Check if current angle will be at boundary after clamping
+        will_be_at_max = angle >= max_val - 0.1
+        will_be_at_min = angle <= min_val + 0.1
+        
+        # Update boundary count
+        if will_be_at_max or will_be_at_min:
+            boundary_count += 1
+        else:
+            boundary_count = 0  # Reset if not at boundary
+        
+        # If stuck at boundary for multiple frames, force unwrapping
+        force_unwrap = boundary_count >= 2
+        
+        # If at max boundary and angle is at or above max, unwrap to negative side
+        if (at_max_boundary or will_be_at_max) and (raw_diff > 0.1 or angle > max_val or force_unwrap):
+            excess = max(0, angle - max_val)
+            angle = min_val + excess
+            # Limit unwrapping to prevent going too far past center
+            if angle > 0:
+                angle = min(angle, 0)  # Don't go positive
+            if force_unwrap:
+                boundary_count = 0  # Reset after forced unwrap
+        # If at min boundary and angle is at or below min, unwrap to positive side
+        elif (at_min_boundary or will_be_at_min) and (raw_diff < -0.1 or angle < min_val or force_unwrap):
+            excess = max(0, min_val - angle)
+            angle = max_val - excess
+            # Limit unwrapping to prevent going too far past center
+            if angle < 0:
+                angle = max(angle, 0)  # Don't go negative
+            if force_unwrap:
+                boundary_count = 0  # Reset after forced unwrap
+        
+        # Now clamp to desired range
+        angle = max(min_val, min(max_val, angle))
+        return angle, boundary_count
+    
+    def get_angles(self):
+        """
+        Get current orientation angles relative to connection time (calibrated).
+        All angles are normalized to -90..+90 degrees range with smooth wrapping.
+        
+        Returns:
+            dict: Dictionary with 'roll', 'pitch', 'yaw' in degrees (relative to initial position, normalized to -90..+90)
+        """
+        # Calculate relative angles (raw, before normalization)
+        rel_roll = self.roll - self.offset_roll
+        rel_pitch = self.pitch - self.offset_pitch
+        rel_yaw = self.yaw - self.offset_yaw
+        
+        # Normalize all angles to -90..+90 range with smooth wrapping
+        # Pass both raw previous angle and normalized previous angle for better unwrapping
+        norm_roll, self.boundary_count_roll = self.normalize_angle(
+            rel_roll, self.prev_raw_roll, self.prev_norm_roll, self.boundary_count_roll)
+        norm_pitch, self.boundary_count_pitch = self.normalize_angle(
+            rel_pitch, self.prev_raw_pitch, self.prev_norm_pitch, self.boundary_count_pitch)
+        norm_yaw, self.boundary_count_yaw = self.normalize_angle(
+            rel_yaw, self.prev_raw_yaw, self.prev_norm_yaw, self.boundary_count_yaw)
+        
+        # Update previous angles for next call (both raw and normalized)
+        self.prev_raw_roll = rel_roll
+        self.prev_raw_pitch = rel_pitch
+        self.prev_raw_yaw = rel_yaw
+        self.prev_norm_roll = norm_roll
+        self.prev_norm_pitch = norm_pitch
+        self.prev_norm_yaw = norm_yaw
+        
         return {
-            'roll': self.roll,
-            'pitch': self.pitch,
-            'yaw': self.yaw
+            'roll': norm_roll,
+            'pitch': norm_pitch,
+            'yaw': norm_yaw
         }
+    
+    def reset_calibration(self):
+        """
+        Reset calibration offsets. Next connection will recalibrate.
+        """
+        self.offset_roll = 0.0
+        self.offset_pitch = 0.0
+        self.offset_yaw = 0.0
+        self.calibrated = False
     
     async def websocket_handler(self, request):
         """Handle WebSocket connections for IMU data"""
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         
-        print(f"\niPhone connected from {request.remote}")
+        print(f"\nPhone connected from {request.remote}")
+        
+        # Reset calibration for new connection
+        self.calibrated = False
+        self.offset_roll = 0.0
+        self.offset_pitch = 0.0
+        self.offset_yaw = 0.0
         
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
                     
-                    # Use iOS fused orientation
-                    self.roll = data.get('roll', 0.0)
-                    self.pitch = data.get('pitch', 0.0)
-                    self.yaw = data.get('yaw', 0.0)
-                    print(f"\r[iOS Fused] Roll: {self.roll:7.2f}° | Pitch: {self.pitch:7.2f}° | Yaw: {self.yaw:7.2f}°", end='')
+                    # Get raw orientation values
+                    raw_roll = data.get('roll', 0.0)
+                    raw_pitch = data.get('pitch', 0.0)
+                    raw_yaw = data.get('yaw', 0.0)
+                    
+                    # Calibrate on first data received
+                    if not self.calibrated:
+                        self.offset_roll = raw_roll
+                        self.offset_pitch = raw_pitch
+                        self.offset_yaw = raw_yaw
+                        self.calibrated = True
+                        print(f"\n✓ Calibration set: Roll={self.offset_roll:.2f}°, Pitch={self.offset_pitch:.2f}°, Yaw={self.offset_yaw:.2f}°")
+                    
+                    # Store raw values
+                    self.roll = raw_roll
+                    self.pitch = raw_pitch
+                    self.yaw = raw_yaw
+                    
+                    # Get normalized angles (same as get_angles() returns)
+                    angles = self.get_angles()
+                    
+                    print(f"\r[Normalized] Roll: {angles['roll']:7.2f}° | Pitch: {angles['pitch']:7.2f}° | Yaw: {angles['yaw']:7.2f}°", end='')
                     
                     # Add your custom processing here
-                    # You can access self.roll, self.pitch, self.yaw
+                    # You can access self.roll, self.pitch, self.yaw (raw values)
+                    # Or use get_angles() for relative values
                     
                 except json.JSONDecodeError:
                     print("Invalid JSON received")
             elif msg.type == web.WSMsgType.ERROR:
                 print(f'WebSocket error: {ws.exception()}')
         
-        print("\niPhone disconnected")
+        # Reset calibration on disconnect
+        self.calibrated = False
+        self.offset_roll = 0.0
+        self.offset_pitch = 0.0
+        self.offset_yaw = 0.0
+        self.prev_raw_roll = 0.0
+        self.prev_raw_pitch = 0.0
+        self.prev_raw_yaw = 0.0
+        self.prev_norm_roll = 0.0
+        self.prev_norm_pitch = 0.0
+        self.prev_norm_yaw = 0.0
+        self.boundary_count_roll = 0
+        self.boundary_count_pitch = 0
+        self.boundary_count_yaw = 0
+        print("\nPhone disconnected (calibration reset)")
         return ws
     
     async def index_handler(self, request):
@@ -504,11 +704,13 @@ class PhoneServer:
             print("XLeRobotHead - IMU & RealSense Server")
             print("=" * 70)
             print(f"✓ Server started with HTTPS support!")
-            print(f"\n📱 iPhone: Open Safari and go to:")
+            print(f"\n📱 Mobile Device: Open browser and go to:")
             print(f"   https://{local_ip}:{port}\n")
-            print(f"Features available:")
+            print(f"   • iOS: Use Safari")
+            print(f"   • Android: Use Chrome or Firefox")
+            print(f"\nFeatures available:")
             print(f"  • Video Frame Streaming (external frames)")
-            print(f"  • iOS IMU/Orientation Data (Fused)")
+            print(f"  • Mobile IMU/Orientation Data (iOS & Android)")
             print("=" * 70)
             print("Waiting for connection...\n")
             
