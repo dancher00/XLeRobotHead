@@ -1,0 +1,535 @@
+import asyncio
+import json
+import socket
+import ssl
+import os
+import cv2
+import numpy as np
+try:
+    import pyrealsense2 as rs
+    REALSENSE_AVAILABLE = True
+except ImportError:
+    REALSENSE_AVAILABLE = False
+    print("Warning: pyrealsense2 not available. RealSense streaming will be disabled.")
+
+from aiohttp import web
+
+class PhoneServer:
+    """Main server class for iPhone IMU and RealSense camera streaming"""
+    
+    HTML_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>XLeRobotHead - IMU & RealSense</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+            max-width: 400px;
+            width: 100%;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 24px;
+        }
+        .status {
+            text-align: center;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            font-weight: bold;
+            font-size: 16px;
+        }
+        .status.disconnected {
+            background: #fee;
+            color: #c33;
+        }
+        .status.connected {
+            background: #efe;
+            color: #3c3;
+        }
+        .data-section {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+        .section-title {
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 14px;
+        }
+        .data-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e0e0e0;
+            font-size: 14px;
+        }
+        .data-row:last-child {
+            border-bottom: none;
+        }
+        .label {
+            font-weight: bold;
+            color: #666;
+        }
+        .value {
+            font-family: 'Courier New', monospace;
+            color: #333;
+        }
+        button {
+            width: 100%;
+            padding: 15px;
+            font-size: 18px;
+            border: none;
+            border-radius: 10px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .btn-start {
+            background: #667eea;
+            color: white;
+        }
+        .btn-start:active {
+            background: #5568d3;
+        }
+        .btn-stop {
+            background: #f56565;
+            color: white;
+        }
+        .btn-stop:active {
+            background: #e05555;
+        }
+        .info {
+            text-align: center;
+            color: #666;
+            font-size: 12px;
+            margin-top: 15px;
+        }
+        .rate {
+            text-align: center;
+            color: #999;
+            font-size: 11px;
+            margin-top: 5px;
+        }
+        .video-container {
+            width: 100%;
+            margin-bottom: 15px;
+            border-radius: 10px;
+            overflow: hidden;
+            background: #000;
+        }
+        .video-container img {
+            width: 100%;
+            display: block;
+        }
+        .video-label {
+            background: #667eea;
+            color: white;
+            padding: 8px;
+            font-size: 12px;
+            font-weight: bold;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 XLeRobotHead</h1>
+        
+        <div class="video-container">
+            <div class="video-label">📹 RealSense Camera</div>
+            <img id="realsenseStream" src="/realsense_stream" alt="RealSense Stream" style="width: 100%; display: none;">
+        </div>
+        
+        <h2>📱 iPhone IMU Sender</h2>
+        
+        <div id="imuStatus" class="status disconnected">
+            Disconnected
+        </div>
+        
+        <div class="data-section">
+            <div class="section-title">Orientation</div>
+            <div class="data-row">
+                <span class="label">Roll:</span>
+                <span class="value" id="roll">0.00°</span>
+            </div>
+            <div class="data-row">
+                <span class="label">Pitch:</span>
+                <span class="value" id="pitch">0.00°</span>
+            </div>
+            <div class="data-row">
+                <span class="label">Yaw:</span>
+                <span class="value" id="yaw">0.00°</span>
+            </div>
+        </div>
+        
+        <button id="toggleBtn" class="btn-start" onclick="toggleStreaming()">
+            Start Streaming
+        </button>
+        
+        <div class="info">
+            <span>iOS sensor fusion</span>
+        </div>
+        <div class="rate" id="updateRate"></div>
+    </div>
+
+    <script>
+        // IMU WebSocket
+        let ws = null;
+        let isStreaming = false;
+        let updateCount = 0;
+        let lastRateUpdate = Date.now();
+        
+        function updateIMUStatus(connected) {
+            const statusEl = document.getElementById('imuStatus');
+            if (statusEl) {
+                statusEl.textContent = connected ? 'Connected ✓' : 'Disconnected';
+                statusEl.className = 'status ' + (connected ? 'connected' : 'disconnected');
+            }
+        }
+        
+        function updateRate() {
+            const now = Date.now();
+            const elapsed = (now - lastRateUpdate) / 1000;
+            if (elapsed >= 1.0) {
+                const rate = (updateCount / elapsed).toFixed(1);
+                document.getElementById('updateRate').textContent = rate + ' Hz';
+                updateCount = 0;
+                lastRateUpdate = now;
+            }
+        }
+        
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                updateIMUStatus(true);
+            };
+            
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                updateIMUStatus(false);
+                if (isStreaming) {
+                    setTimeout(connectWebSocket, 2000);
+                }
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+        }
+        
+        function handleOrientation(event) {
+            const alpha = event.alpha || 0;
+            const beta = event.beta || 0;
+            const gamma = event.gamma || 0;
+            
+            document.getElementById('roll').textContent = gamma.toFixed(2) + '°';
+            document.getElementById('pitch').textContent = beta.toFixed(2) + '°';
+            document.getElementById('yaw').textContent = alpha.toFixed(2) + '°';
+            
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    mode: 'fused',
+                    roll: gamma,
+                    pitch: beta,
+                    yaw: alpha
+                }));
+            }
+            
+            updateCount++;
+            updateRate();
+        }
+        
+        async function toggleStreaming() {
+            const btn = document.getElementById('toggleBtn');
+            
+            if (!isStreaming) {
+                // Request permissions
+                if (typeof DeviceOrientationEvent !== 'undefined' && 
+                    typeof DeviceOrientationEvent.requestPermission === 'function') {
+                    try {
+                        const permission = await DeviceOrientationEvent.requestPermission();
+                        if (permission !== 'granted') {
+                            alert('Permission denied for device orientation');
+                            return;
+                        }
+                    } catch (error) {
+                        alert('Error requesting permission: ' + error);
+                        return;
+                    }
+                }
+                
+                connectWebSocket();
+                window.addEventListener('deviceorientation', handleOrientation);
+                
+                // Start RealSense stream
+                const realsenseStream = document.getElementById('realsenseStream');
+                if (realsenseStream) {
+                    realsenseStream.src = '/realsense_stream?' + new Date().getTime();
+                    realsenseStream.style.display = 'block';
+                }
+                
+                isStreaming = true;
+                btn.textContent = 'Stop Streaming';
+                btn.className = 'btn-stop';
+                lastRateUpdate = Date.now();
+                updateCount = 0;
+            } else {
+                window.removeEventListener('deviceorientation', handleOrientation);
+                if (ws) {
+                    ws.close();
+                }
+                
+                // Stop RealSense stream
+                const realsenseStream = document.getElementById('realsenseStream');
+                if (realsenseStream) {
+                    realsenseStream.src = '';
+                    realsenseStream.style.display = 'none';
+                }
+                
+                isStreaming = false;
+                btn.textContent = 'Start Streaming';
+                btn.className = 'btn-start';
+                updateIMUStatus(false);
+                document.getElementById('updateRate').textContent = '';
+            }
+        }
+    </script>
+</body>
+</html>"""
+    
+    def __init__(self):
+        """Initialize the server"""
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.yaw = 0.0
+        
+        # RealSense camera setup
+        self.realsense_pipeline = None
+        self.realsense_config = None
+        self.realsense_lock = asyncio.Lock()
+        
+        if REALSENSE_AVAILABLE:
+            try:
+                self.realsense_pipeline = rs.pipeline()
+                self.realsense_config = rs.config()
+                self.realsense_config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+                self.realsense_pipeline.start(self.realsense_config)
+                print("✓ RealSense camera initialized")
+            except Exception as e:
+                print(f"⚠ RealSense camera error: {e}")
+                self.realsense_pipeline = None
+    
+    @staticmethod
+    def get_local_ip():
+        """Get the local IP address of this computer"""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(('10.255.255.255', 1))
+            ip = s.getsockname()[0]
+        except Exception:
+            ip = '127.0.0.1'
+        finally:
+            s.close()
+        return ip
+    
+    @staticmethod
+    def create_self_signed_cert():
+        """Create a self-signed certificate for HTTPS"""
+        try:
+            from OpenSSL import crypto
+            
+            k = crypto.PKey()
+            k.generate_key(crypto.TYPE_RSA, 2048)
+            
+            cert = crypto.X509()
+            cert.get_subject().C = "US"
+            cert.get_subject().ST = "State"
+            cert.get_subject().L = "City"
+            cert.get_subject().O = "OrientationApp"
+            cert.get_subject().OU = "OrientationApp"
+            cert.get_subject().CN = PhoneServer.get_local_ip()
+            cert.set_serial_number(1000)
+            cert.gmtime_adj_notBefore(0)
+            cert.gmtime_adj_notAfter(365*24*60*60)
+            cert.set_issuer(cert.get_subject())
+            cert.set_pubkey(k)
+            cert.sign(k, 'sha256')
+            
+            with open("cert.pem", "wb") as f:
+                f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+            
+            with open("key.pem", "wb") as f:
+                f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, k))
+            
+            print("✓ SSL certificate created successfully")
+            return True
+        except ImportError:
+            print("\n⚠ pyOpenSSL not installed. Installing it now...")
+            import subprocess
+            subprocess.check_call(['pip', 'install', 'pyOpenSSL'])
+            print("✓ pyOpenSSL installed. Please run the script again.")
+            return False
+    
+    async def get_realsense_frame(self):
+        """Get the latest frame from RealSense camera"""
+        if not self.realsense_pipeline:
+            return None
+        
+        try:
+            frames = self.realsense_pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                return None
+            
+            frame = np.asanyarray(color_frame.get_data())
+            # Convert BGR to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            return frame
+        except Exception as e:
+            print(f"RealSense frame error: {e}")
+            return None
+    
+    def stop_realsense(self):
+        """Stop RealSense camera"""
+        if self.realsense_pipeline:
+            try:
+                self.realsense_pipeline.stop()
+                print("✓ RealSense camera stopped")
+            except:
+                pass
+    
+    async def websocket_handler(self, request):
+        """Handle WebSocket connections for IMU data"""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        
+        print(f"\niPhone connected from {request.remote}")
+        
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                    
+                    # Use iOS fused orientation
+                    self.roll = data.get('roll', 0.0)
+                    self.pitch = data.get('pitch', 0.0)
+                    self.yaw = data.get('yaw', 0.0)
+                    print(f"\r[iOS Fused] Roll: {self.roll:7.2f}° | Pitch: {self.pitch:7.2f}° | Yaw: {self.yaw:7.2f}°", end='')
+                    
+                    # Add your custom processing here
+                    # You can access self.roll, self.pitch, self.yaw
+                    
+                except json.JSONDecodeError:
+                    print("Invalid JSON received")
+            elif msg.type == web.WSMsgType.ERROR:
+                print(f'WebSocket error: {ws.exception()}')
+        
+        print("\niPhone disconnected")
+        return ws
+    
+    async def index_handler(self, request):
+        """Handle main page requests"""
+        return web.Response(text=self.HTML_PAGE, content_type='text/html')
+    
+    async def realsense_stream_handler(self, request):
+        """MJPEG stream handler for RealSense video"""
+        response = web.StreamResponse()
+        response.headers['Content-Type'] = 'multipart/x-mixed-replace; boundary=frame'
+        await response.prepare(request)
+        
+        print(f"RealSense stream started for {request.remote}")
+        
+        while True:
+            frame = await self.get_realsense_frame()
+            if frame is not None:
+                # Encode frame as JPEG
+                _, buffer = cv2.imencode('.jpg', cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), 
+                                        [cv2.IMWRITE_JPEG_QUALITY, 85])
+                
+                await response.write(b'--frame\r\n')
+                await response.write(b'Content-Type: image/jpeg\r\n\r\n')
+                await response.write(buffer.tobytes())
+                await response.write(b'\r\n')
+            
+            await asyncio.sleep(1/30)  # ~30 FPS
+    
+    def create_app(self):
+        """Create aiohttp web application"""
+        app = web.Application()
+        app.router.add_get('/', self.index_handler)
+        app.router.add_get('/ws', self.websocket_handler)
+        app.router.add_get('/realsense_stream', self.realsense_stream_handler)
+        return app
+    
+    def start_server(self, host='0.0.0.0', port=8443):
+        """Start the HTTPS server"""
+        if not os.path.exists('cert.pem') or not os.path.exists('key.pem'):
+            print("Creating SSL certificate...")
+            if not self.create_self_signed_cert():
+                return
+        
+        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_context.load_cert_chain('cert.pem', 'key.pem')
+        
+        local_ip = self.get_local_ip()
+        print("\n" + "=" * 70)
+        print("XLeRobotHead - IMU & RealSense Server")
+        print("=" * 70)
+        print(f"✓ Server started with HTTPS support!")
+        print(f"\n📱 iPhone: Open Safari and go to:")
+        print(f"   https://{local_ip}:{port}\n")
+        print(f"Features available:")
+        print(f"  • RealSense Camera Streaming")
+        print(f"  • iOS IMU/Orientation Data (Fused)")
+        if not REALSENSE_AVAILABLE:
+            print(f"  ⚠ RealSense not available (install pyrealsense2)")
+        print("=" * 70)
+        print("Waiting for connection...\n")
+        
+        app = self.create_app()
+        web.run_app(app, host=host, port=port, ssl_context=ssl_context, print=None)
+    
+    def run(self):
+        """Run the server (main entry point)"""
+        try:
+            self.start_server()
+        except KeyboardInterrupt:
+            print("\n\nServer stopped by user")
+        finally:
+            # Cleanup
+            self.stop_realsense()
+
+
+def main():
+    """Main function"""
+    server = PhoneServer()
+    server.run()
+
+
+if __name__ == "__main__":
+    main()
