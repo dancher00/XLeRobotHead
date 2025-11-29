@@ -559,7 +559,7 @@ class PhoneServer:
         return {
             'roll': norm_roll,
             'pitch': norm_pitch,
-            'yaw': norm_yaw
+            'yaw': -norm_yaw  # Reversed yaw
         }
     
     def reset_calibration(self):
